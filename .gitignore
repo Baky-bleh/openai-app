@@ -1,0 +1,20 @@
+# Environment variables - keep API keys secure
+.env
+.streamlit/secrets.toml
+
+# Virtual environment - these files are specific to your machine
+venv/
+env/
+
+# Python cache files - these get regenerated automatically
+__pycache__/
+*.pyc
+*.pyo
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
