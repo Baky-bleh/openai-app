@@ -5,6 +5,8 @@
 # Virtual environment - these files are specific to your machine
 venv/
 env/
+.env/
+.venv/
 
 # Python cache files - these get regenerated automatically
 __pycache__/

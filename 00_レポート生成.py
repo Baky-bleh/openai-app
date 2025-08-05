@@ -115,7 +115,7 @@ DEFAULT_JSON_PROMPT = """入力データから次の 4 項目を JSON で抽出�
 """
 
 # ------------ OpenAI クライアント --------------
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 
 async def run_agent(conversation: str, prompt: str) -> str:
