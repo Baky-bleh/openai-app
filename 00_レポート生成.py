@@ -5,6 +5,8 @@ import uuid
 from datetime import datetime
 
 import streamlit as st
+import requests
+from bs4 import BeautifulSoup
 from openai import OpenAI
 from utils.data_io import append_record
 
@@ -139,6 +141,108 @@ def extract_json(report: str, json_prompt: str) -> dict:
     return json.loads(resp.choices[0].message.content)
 
 
+def clean_html_content(html_content: str) -> str:
+    """HTMLコンテンツをプレーンテキストに変換"""
+    if not html_content:
+        return ""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    return soup.get_text(separator=' ', strip=True)
+
+
+def format_teams_conversation(teams_data: dict) -> str:
+    """Power AutomateのレスポンスをLLM用の対話履歴にフォーマット"""
+    formatted_lines = []
+    
+    # 依頼内容（最初の投稿）
+    request_details = teams_data.get('requestDetails', [])
+    if request_details and len(request_details) > 0:
+        original_post = request_details[0]
+        if original_post and isinstance(original_post, dict) and original_post.get('from'):
+            sender_name = original_post.get('from', {}).get('user', {}).get('displayName', '不明なユーザー')
+            timestamp = original_post.get('createdDateTime', '')
+            subject = original_post.get('subject', '')
+            content = clean_html_content(original_post.get('body', {}).get('content', ''))
+            
+            formatted_lines.append(f"=== 依頼内容 ===")
+            formatted_lines.append(f"送信者: {sender_name}")
+            formatted_lines.append(f"日時: {timestamp}")
+            if subject:
+                formatted_lines.append(f"件名: {subject}")
+            formatted_lines.append(f"内容: {content}")
+            formatted_lines.append("")
+    
+    # 返信処理 - 実際のデータ構造に合わせて修正
+    replies_data = teams_data.get('replies', [])
+    if replies_data and len(replies_data) > 0:
+        replies_container = replies_data[0]
+        if replies_container and isinstance(replies_container, dict):
+            replies = replies_container.get('value', [])
+            if replies and len(replies) > 0:
+                formatted_lines.append("=== 返信・やり取り ===")
+                for i, reply in enumerate(replies, 1):
+                    if reply and isinstance(reply, dict) and reply.get('from'):
+                        sender_name = reply.get('from', {}).get('user', {}).get('displayName', '不明なユーザー')
+                        timestamp = reply.get('createdDateTime', '')
+                        content = clean_html_content(reply.get('body', {}).get('content', ''))
+                        
+                        formatted_lines.append(f"返信{i}: {sender_name} ({timestamp})")
+                        formatted_lines.append(f"{content}")
+                        formatted_lines.append("")
+    
+    return "\n".join(formatted_lines) if formatted_lines else "データの解析に失敗しました"
+
+
+def fetch_teams_chat(team_name: str, channel_name: str, subject: str, debug_mode: bool = False) -> tuple[bool, str]:
+    """Power Automate flowからTeamsチャットデータを取得"""
+    try:
+        power_automate_url = 'https://prod-51.japaneast.logic.azure.com:443/workflows/6fd03f1d8b7d43faa34d3ad2f7ea5346/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=tTETGgyiK590LDvsepZC2cmT-6GDvaiEF1Et3FS89fA'
+        
+        flow_data = {
+            'teamName': team_name,
+            'channelName': channel_name,
+            'subject': subject
+        }
+        
+        response = requests.post(
+            power_automate_url,
+            json=flow_data,
+            headers={'Content-Type': 'application/json'},
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            response_text = response.text[:500] if hasattr(response, 'text') else 'No response text'
+            return False, f"Power Automateエラー: Status {response.status_code}, Response: {response_text}"
+        
+        try:
+            teams_data = response.json()
+        except json.JSONDecodeError as e:
+            return False, f"JSON解析エラー: {str(e)}, Response: {response.text[:200]}"
+        
+        # デバッグ情報をStreamlitに表示
+        if debug_mode:
+            st.info(f"🔍 デバッグ: 受信データのキー = {list(teams_data.keys()) if isinstance(teams_data, dict) else type(teams_data)}")
+            st.code(json.dumps(teams_data, ensure_ascii=False, indent=2), language="json")
+        
+        formatted_conversation = format_teams_conversation(teams_data)
+        
+        if not formatted_conversation.strip() or formatted_conversation == "データの解析に失敗しました":
+            return False, f"データの解析に失敗しました。デバッグモードを有効にして詳細を確認してください。"
+        
+        return True, formatted_conversation
+        
+    except requests.exceptions.Timeout:
+        return False, "リクエストがタイムアウトしました (30秒)"
+    except requests.exceptions.RequestException as e:
+        return False, f"ネットワークエラー: {str(e)}"
+    except AttributeError as e:
+        return False, f"データ属性エラー (NoneType): {str(e)}"
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        return False, f"予期せぬエラー: {str(e)}\n詳細: {error_details[:200]}..."
+
+
 # ================= Streamlit UI =================
 st.header("📝 フラストレーションレポート生成")
 
@@ -148,13 +252,41 @@ with st.expander("システムプロンプトを編集する", expanded=False):
 with st.expander("JSON 抽出プロンプトを編集する", expanded=False):
     json_prompt = st.text_area("JSON Prompt", value=DEFAULT_JSON_PROMPT, height=120)
 
-conversation = st.text_area("対話履歴を貼り付けてください", height=280)
+# Teams チャット取得セクション
+with st.expander("📥 Teamsから履歴を取得", expanded=False):
+    st.write("チーム内の対話履歴を自動取得してフラストレーション分析を行えます。")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        team_name = st.text_input("チーム名", placeholder="例: プロジェクトチーム")
+        subject = st.text_input("メッセージのキーワード（件名）", placeholder="例: 週次報告")
+    
+    with col2:
+        channel_name = st.text_input("チャンネル名", placeholder="例: 全般")
+    
+    if st.button("📥 Teamsから履歴を取得", disabled=not (team_name and channel_name and subject)):
+        with st.spinner("Teamsから履歴を取得中..."):
+            success, result = fetch_teams_chat(team_name, channel_name, subject, False)
+            
+        if success:
+            st.success("✅ 履歴を取得しました！下記の対話履歴欄に自動入力されます。")
+            st.session_state.conversation_content = result
+        else:
+            st.error(f"❌ エラー: {result}")
+
+# 対話履歴入力欄（Teams取得データまたは手動入力）
+conversation = st.text_area(
+    "対話履歴を貼り付けてください", 
+    value=st.session_state.get('conversation_content', ''),
+    height=280,
+    help="手動で貼り付けるか、上の「Teamsから履歴を取得」ボタンを使用してください"
+)
 
 if st.button("🚀 レポート生成", disabled=not conversation.strip()):
     with st.spinner("LLM 生成中..."):
         report = asyncio.run(run_agent(conversation, agent_prompt))
         extracted = extract_json(report, json_prompt)
-        extracted["timestamp"] = datetime.utcnow().isoformat()
+        extracted["timestamp"] = datetime.now().isoformat()
         append_record(extracted)
 
     st.success("✅ 生成＆保存しました")
